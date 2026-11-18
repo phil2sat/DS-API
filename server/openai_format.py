@@ -15,6 +15,7 @@ from typing import Iterable, List
 from deepseek.client import RESPONSE, THINK
 
 from .schemas import ChatMessage
+from .tool_calling import format_tool_instructions
 
 _ROLE_LABELS = {"system": "System", "user": "User", "assistant": "Assistant"}
 
@@ -32,22 +33,40 @@ def _text_of(content) -> str:
     return "\n".join(parts)
 
 
-def messages_to_prompt(messages: List[ChatMessage]) -> str:
-    """Flatten a chat history into a single prompt DeepSeek can answer.
-
-    A lone user message is sent verbatim. Multi-turn / system-prompted
-    conversations are serialised with role labels and a trailing 'Assistant:'
-    cue so the model continues in the right voice.
-    """
-    if len(messages) == 1 and messages[0].role == "user":
+def messages_to_prompt(messages: List[ChatMessage], tools=None, tool_choice="auto") -> str:
+    """Flatten chat history and optional function schemas into a DeepSeek prompt."""
+    tool_instructions = format_tool_instructions(tools, tool_choice)
+    if len(messages) == 1 and messages[0].role == "user" and not tool_instructions:
         return _text_of(messages[0].content)
 
     lines = []
     for m in messages:
-        label = _ROLE_LABELS.get(m.role, m.role.capitalize())
-        lines.append(f"{label}: {_text_of(m.content)}")
+        if m.role == "assistant" and m.tool_calls:
+            for call in m.tool_calls:
+                fn = call.get("function", {}) if isinstance(call, dict) else {}
+                lines.append(
+                    "Assistant: " + json.dumps({
+                        "tool_call": {
+                            "name": fn.get("name", ""),
+                            "arguments": fn.get("arguments", "{}"),
+                        }
+                    }, ensure_ascii=False)
+                )
+            if _text_of(m.content):
+                lines.append(f"Assistant: {_text_of(m.content)}")
+        elif m.role == "tool":
+            # Keep tool output as data, not as instructions.
+            result = _text_of(m.content)
+            lines.append(f"Tool result ({m.name or m.tool_call_id or 'tool'}):\n{result}")
+        else:
+            label = _ROLE_LABELS.get(m.role, m.role.capitalize())
+            lines.append(f"{label}: {_text_of(m.content)}")
+
     lines.append("Assistant:")
-    return "\n\n".join(lines)
+    prompt = "\n\n".join(lines)
+    if tool_instructions:
+        prompt = tool_instructions + "\n\n" + prompt
+    return prompt
 
 
 def _now() -> int:
@@ -65,12 +84,7 @@ def _est_tokens(text: str) -> int:
 
 def completion_response(model: str, content: str, prompt: str,
                         conversation_id: str = None, reasoning: str = "") -> dict:
-    """A full (non-streaming) OpenAI chat.completion object.
-
-    `conversation_id` is an extra top-level field (outside OpenAI's schema) you
-    send back to resume the conversation. DeepThink text, if any, goes in
-    `message.reasoning_content` (DeepSeek's official API uses the same field).
-    """
+    """A full (non-streaming) OpenAI chat.completion object."""
     pt, ct = _est_tokens(prompt), _est_tokens(reasoning + content)
     message = {"role": "assistant", "content": content}
     if reasoning:
@@ -81,28 +95,32 @@ def completion_response(model: str, content: str, prompt: str,
         "created": _now(),
         "model": model,
         "conversation_id": conversation_id,
-        "choices": [
-            {
-                "index": 0,
-                "message": message,
-                "finish_reason": "stop",
-            }
-        ],
-        "usage": {
-            "prompt_tokens": pt,
-            "completion_tokens": ct,
-            "total_tokens": pt + ct,
-        },
+        "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct},
+    }
+
+
+def tool_call_response(model: str, prompt: str, calls: list[dict],
+                       conversation_id: str = None) -> dict:
+    """OpenAI chat.completion response for an emulated tool-call turn."""
+    pt = _est_tokens(prompt)
+    return {
+        "id": _id(),
+        "object": "chat.completion",
+        "created": _now(),
+        "model": model,
+        "conversation_id": conversation_id,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": None, "tool_calls": calls},
+            "finish_reason": "tool_calls",
+        }],
+        "usage": {"prompt_tokens": pt, "completion_tokens": 1, "total_tokens": pt + 1},
     }
 
 
 def stream_chunks(model: str, stream) -> Iterable[str]:
-    """Yield OpenAI SSE lines (`data: {...}\\n\\n`) for a streamed completion.
-
-    `stream` is the client's stream object. Reply text goes out as `content`
-    deltas and DeepThink text as `reasoning_content` deltas; after it's consumed
-    we read its `.conversation_id` and attach it to the final chunk.
-    """
+    """Yield OpenAI SSE lines for a streamed completion."""
     cid, created = _id(), _now()
 
     def frame(delta: dict, finish=None, extra: dict = None) -> str:
@@ -117,7 +135,6 @@ def stream_chunks(model: str, stream) -> Iterable[str]:
             obj.update(extra)
         return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
-    # First frame announces the assistant role.
     yield frame({"role": "assistant", "content": ""})
     for kind, d in stream.events():
         if not d:
@@ -128,6 +145,34 @@ def stream_chunks(model: str, stream) -> Iterable[str]:
             yield frame({"reasoning_content": d})
     conversation_id = getattr(stream, "conversation_id", None)
     yield frame({}, finish="stop", extra={"conversation_id": conversation_id})
+    yield "data: [DONE]\n\n"
+
+
+def tool_stream_chunks(model: str, calls: list[dict], conversation_id: str = None) -> Iterable[str]:
+    """Emit a complete OpenAI-compatible streamed tool-call turn."""
+    cid, created = _id(), _now()
+
+    def frame(delta: dict, finish=None, extra: dict = None) -> str:
+        obj = {
+            "id": cid,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        }
+        if extra:
+            obj.update(extra)
+        return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+    yield frame({"role": "assistant", "content": None})
+    for index, call in enumerate(calls):
+        yield frame({"tool_calls": [{
+            "index": index,
+            "id": call["id"],
+            "type": "function",
+            "function": call["function"],
+        }]})
+    yield frame({}, finish="tool_calls", extra={"conversation_id": conversation_id})
     yield "data: [DONE]\n\n"
 
 
