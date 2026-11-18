@@ -269,6 +269,34 @@ def _parse_xml_tags(text: str, tools: list[dict] | None) -> list[dict] | None:
     return calls
 
 
+def _parse_nameless_tool_call(text: str, tools: list[dict] | None) -> list[dict] | None:
+    """``<tool_call><parameter name="command">…</parameter></tool_call>`` without a
+    tool name. The tool is inferred, but only when exactly one tool declares all
+    the given parameters; otherwise the reply is left as plain text."""
+    props = _schema_props(tools)
+    m = re.search(r"<tool_call\b[^>]*>(.*?)</tool_call\s*>", text, flags=re.I | re.S)
+    if not m or text[m.end():].strip():
+        return None
+    body, args, pos = m.group(1), {}, 0
+    for p in re.finditer(r"<parameter\b([^>]*)>(.*?)</parameter\s*>", body, flags=re.I | re.S):
+        if body[pos:p.start()].strip():
+            return None
+        n = re.search(r"\bname\s*=\s*([\"'])(.*?)\1", p.group(1), flags=re.I | re.S)
+        if not n or n.group(2) in args:
+            return None
+        args[n.group(2)] = html.unescape(p.group(2).strip())
+        pos = p.end()
+    if not args or body[pos:].strip():
+        return None
+    matches = [name for name, pr in props.items() if set(args) <= set(pr)]
+    if len(matches) != 1:
+        return None
+    spec = props[matches[0]]
+    args = {k: _coerce(v, spec.get(k)) for k, v in args.items()}
+    call = _to_call({"name": matches[0], "arguments": args}, set(props))
+    return [call] if call else None
+
+
 def parse_tool_calls(text: str, tools: list[dict] | None) -> list[dict] | None:
     """Parse strict JSON, legacy TOOL_CALL, fenced JSON, DeepSeek DSML and bare XML tags."""
     if not isinstance(text, str) or len(text) > MAX_TOOL_OUTPUT_CHARS:
@@ -299,4 +327,4 @@ def parse_tool_calls(text: str, tools: list[dict] | None) -> list[dict] | None:
                 return calls
         except json.JSONDecodeError:
             continue
-    return _parse_xml_tags(text, tools)
+    return _parse_nameless_tool_call(text, tools) or _parse_xml_tags(text, tools)

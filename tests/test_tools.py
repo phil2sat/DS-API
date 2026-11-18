@@ -123,3 +123,21 @@ def test_dsml_multiple_invokes_and_json_param():
             '<｜DSML｜parameter name="limit" string="false">5</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>')
     calls = parse_tool_calls(text, DSML_TOOLS)
     assert [json.loads(c["function"]["arguments"]) for c in calls] == [{"command": "a"}, {"command": "b", "limit": 5}]
+
+
+def test_nameless_tool_call_infers_unique_tool():
+    tools = [
+        {"type": "function", "function": {"name": "bash", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}}},
+        {"type": "function", "function": {"name": "read", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}},
+    ]
+    text = ("Zuerst prüfe ich die Tests.\n\n<tool_call>\n"
+            "<parameter name=\"command\">cd /x && cat start.sh && ls -la tests/</parameter>\n</tool_call>")
+    calls = parse_tool_calls(text, tools)
+    assert calls[0]["function"]["name"] == "bash"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"command": "cd /x && cat start.sh && ls -la tests/"}
+
+
+def test_nameless_tool_call_ambiguous_is_not_guessed():
+    tools = [{"type": "function", "function": {"name": n, "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}}}
+             for n in ("bash", "execute_command")]
+    assert parse_tool_calls('<tool_call><parameter name="command">ls</parameter></tool_call>', tools) is None
