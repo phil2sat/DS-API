@@ -78,3 +78,26 @@ def test_stream_plain_text(monkeypatch):
     frames = [json.loads(l[6:]) for l in r.text.splitlines() if l.startswith("data: {")]
     assert any(f["choices"][0]["delta"].get("content") == "Hallo!" for f in frames)
     assert frames[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+BASH_TOOLS = [{"type": "function", "function": {"name": n, "parameters": {"type": "object",
+               "properties": {"path": {"type": "string"}, "command": {"type": "string"}}}}}
+              for n in ("read", "bash")]
+
+
+def test_intro_prose_and_multiple_parallel_tags():
+    text = ("I'll take a look at the project now.\n"
+            '<read path="/x/README.md"/> <read path="/x/CLAUDE.md"/>'
+            '<bash command="cd /x && find app | sort && echo \'---TREE---\'"/>')
+    calls = parse_tool_calls(text, BASH_TOOLS)
+    assert [c["function"]["name"] for c in calls] == ["read", "read", "bash"]
+    assert json.loads(calls[2]["function"]["arguments"])["command"] == "cd /x && find app | sort && echo '---TREE---'"
+
+
+def test_angle_brackets_in_attribute_value():
+    calls = parse_tool_calls('<bash command="ls 2>&1 | head"/>', BASH_TOOLS)
+    assert json.loads(calls[0]["function"]["arguments"]) == {"command": "ls 2>&1 | head"}
+
+
+def test_prose_after_tag_still_rejected():
+    assert parse_tool_calls('Use <read path="x"/> to read it, that is how it works.', BASH_TOOLS) is None

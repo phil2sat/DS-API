@@ -218,12 +218,15 @@ def _parse_xml_tags(text: str, tools: list[dict] | None) -> list[dict] | None:
     body = re.sub(r"^\s*```[a-zA-Z]*\s*|\s*```\s*$", "", text.strip())
     names = "|".join(re.escape(n) for n in sorted(props, key=len, reverse=True))
     pattern = re.compile(
-        rf"<(?P<name>{names})\b(?P<attrs>[^<>]*?)(?:/>|>(?P<inner>.*?)</(?P=name)\s*>)",
+        rf"<(?P<name>{names})\b(?P<attrs>(?:[^<>\"']|\"[^\"]*\"|'[^']*')*?)(?:/>|>(?P<inner>.*?)</(?P=name)\s*>)",
         re.S,
     )
-    calls, cursor = [], 0
+    calls, cursor = [], None
     for m in pattern.finditer(body):
-        if body[cursor:m.start()].strip():
+        # Intro prose before the first tag is fine; once calls start, only
+        # further calls (and whitespace) may follow, so prose that merely
+        # mentions a tag in a sentence is not treated as a call.
+        if cursor is not None and body[cursor:m.start()].strip():
             return None
         name, spec = m.group("name"), props[m.group("name")]
         args = {
