@@ -183,8 +183,75 @@ def _parse_dsml(text: str, allowed: set[str]) -> list[dict] | None:
     return [call] if call else None
 
 
+def _schema_props(tools: list[dict] | None) -> dict[str, dict]:
+    out = {}
+    for tool in tools or []:
+        fn = _function(tool)
+        if fn and isinstance(fn.get("name"), str):
+            params = fn.get("parameters")
+            props = params.get("properties") if isinstance(params, dict) else None
+            out[fn["name"]] = props if isinstance(props, dict) else {}
+    return out
+
+
+def _coerce(value: str, spec: Any) -> Any:
+    """Convert an XML attribute/text value to the type its JSON Schema asks for."""
+    kind = spec.get("type") if isinstance(spec, dict) else None
+    if kind in ("integer", "number", "boolean", "array", "object"):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    return value
+
+
+_TAG_ATTR = re.compile(r"([A-Za-z_][\w.:-]*)\s*=\s*(\"(.*?)\"|'(.*?)')", re.S)
+
+
+def _parse_xml_tags(text: str, tools: list[dict] | None) -> list[dict] | None:
+    """Fallback for models that improvise calls as ``<read path="x"/>`` or
+    ``<tool><arg>value</arg></tool>``. Only accepted when the whole reply (minus
+    an optional code fence) consists of tags naming known tools."""
+    props = _schema_props(tools)
+    if not props:
+        return None
+    body = re.sub(r"^\s*```[a-zA-Z]*\s*|\s*```\s*$", "", text.strip())
+    names = "|".join(re.escape(n) for n in sorted(props, key=len, reverse=True))
+    pattern = re.compile(
+        rf"<(?P<name>{names})\b(?P<attrs>[^<>]*?)(?:/>|>(?P<inner>.*?)</(?P=name)\s*>)",
+        re.S,
+    )
+    calls, cursor = [], 0
+    for m in pattern.finditer(body):
+        if body[cursor:m.start()].strip():
+            return None
+        name, spec = m.group("name"), props[m.group("name")]
+        args = {
+            a.group(1): _coerce(html.unescape(a.group(3) if a.group(3) is not None else a.group(4)),
+                                spec.get(a.group(1)))
+            for a in _TAG_ATTR.finditer(m.group("attrs"))
+        }
+        inner = m.group("inner")
+        if inner and inner.strip():
+            children = list(re.finditer(r"<([A-Za-z_][\w.:-]*)>(.*?)</\1\s*>", inner, re.S))
+            rest = re.sub(r"<([A-Za-z_][\w.:-]*)>(.*?)</\1\s*>", "", inner, flags=re.S).strip()
+            if children and not rest:
+                for c in children:
+                    args[c.group(1)] = _coerce(html.unescape(c.group(2).strip()), spec.get(c.group(1)))
+            else:
+                return None
+        call = _to_call({"name": name, "arguments": args}, set(props))
+        if not call:
+            return None
+        calls.append(call)
+        cursor = m.end()
+    if not calls or body[cursor:].strip():
+        return None
+    return calls
+
+
 def parse_tool_calls(text: str, tools: list[dict] | None) -> list[dict] | None:
-    """Parse strict JSON, legacy TOOL_CALL, fenced JSON, and DeepSeek DSML."""
+    """Parse strict JSON, legacy TOOL_CALL, fenced JSON, DeepSeek DSML and bare XML tags."""
     if not isinstance(text, str) or len(text) > MAX_TOOL_OUTPUT_CHARS:
         return None
     allowed = tool_names(tools)
@@ -213,4 +280,4 @@ def parse_tool_calls(text: str, tools: list[dict] | None) -> list[dict] | None:
                 return calls
         except json.JSONDecodeError:
             continue
-    return None
+    return _parse_xml_tags(text, tools)

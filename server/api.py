@@ -44,9 +44,13 @@ from .openai_format import (
     messages_to_prompt,
     stream_chunks,
     stream_error,
+    text_stream_chunks,
+    tool_call_response,
+    tool_stream_chunks,
 )
 from .ratelimit import RateLimiter, install_rate_limit
 from .schemas import ChatCompletionRequest
+from .tool_calling import parse_tool_calls, tool_names
 
 app = FastAPI(title="DeepSeek OpenAI-compatible API", version="0.1.0")
 install_rate_limit(
@@ -119,7 +123,14 @@ async def chat_completions(req: ChatCompletionRequest):
     # A thread's model is fixed when it's created, so on resume we ignore `model`
     # (the OpenAI SDK always sends one) and let the existing thread's model stand.
     model_type = None if req.conversation_id else resolve_model_type(req.model)
-    prompt = messages_to_prompt(req.messages)
+    # Tool calling is emulated: the tool schemas are injected into the prompt and
+    # the model's text reply is parsed back into OpenAI `tool_calls`.
+    use_tools = bool(req.tools) and req.tool_choice != "none" and bool(tool_names(req.tools))
+    prompt = messages_to_prompt(
+        req.messages,
+        req.tools if use_tools else None,
+        req.tool_choice,
+    )
 
     try:
         # Off the event loop: get_client() uses Playwright's sync API, which
@@ -129,6 +140,32 @@ async def chat_completions(req: ChatCompletionRequest):
         return _error(str(e), status=503, err_type="login_required")
     except Exception as e:  # session/login failure
         return _error(f"Failed to initialise DeepSeek session: {e}")
+
+    if use_tools:
+        # A tool call can only be recognised in the complete reply, so buffer it
+        # (even for stream=true) and then emit either tool_calls or plain text.
+        try:
+            reply = await run_in_threadpool(
+                client.chat, prompt, req.conversation_id,
+                model_type, req.thinking, req.search,
+            )
+        except LoginRequired as e:
+            return _error(str(e), status=503, err_type="login_required")
+        except Exception as e:
+            return _error(f"DeepSeek request failed: {e}")
+
+        calls = parse_tool_calls(reply.text, req.tools)
+        if req.stream:
+            if calls:
+                gen = tool_stream_chunks(req.model, calls, reply.conversation_id)
+            else:
+                gen = text_stream_chunks(req.model, reply.text, reply.reasoning,
+                                         reply.conversation_id)
+            return StreamingResponse(gen, media_type="text/event-stream")
+        if calls:
+            return tool_call_response(req.model, prompt, calls, reply.conversation_id)
+        return completion_response(req.model, reply.text, prompt, reply.conversation_id,
+                                   reply.reasoning)
 
     if req.stream:
         # Open the thread before responding, so failures here (bad session,

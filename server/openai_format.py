@@ -148,6 +148,32 @@ def stream_chunks(model: str, stream) -> Iterable[str]:
     yield "data: [DONE]\n\n"
 
 
+def text_stream_chunks(model: str, text: str, reasoning: str = "",
+                       conversation_id: str = None) -> Iterable[str]:
+    """Emit an already-complete text reply as an OpenAI SSE stream."""
+    cid, created = _id(), _now()
+
+    def frame(delta: dict, finish=None, extra: dict = None) -> str:
+        obj = {
+            "id": cid,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        }
+        if extra:
+            obj.update(extra)
+        return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+    yield frame({"role": "assistant", "content": ""})
+    if reasoning:
+        yield frame({"reasoning_content": reasoning})
+    if text:
+        yield frame({"content": text})
+    yield frame({}, finish="stop", extra={"conversation_id": conversation_id})
+    yield "data: [DONE]\n\n"
+
+
 def tool_stream_chunks(model: str, calls: list[dict], conversation_id: str = None) -> Iterable[str]:
     """Emit a complete OpenAI-compatible streamed tool-call turn."""
     cid, created = _id(), _now()
