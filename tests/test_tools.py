@@ -101,3 +101,25 @@ def test_angle_brackets_in_attribute_value():
 
 def test_prose_after_tag_still_rejected():
     assert parse_tool_calls('Use <read path="x"/> to read it, that is how it works.', BASH_TOOLS) is None
+
+
+DSML_TOOLS = [{"type": "function", "function": {"name": "bash", "parameters": {"type": "object",
+               "properties": {"command": {"type": "string"}, "limit": {"type": "integer"}}}}}]
+
+
+def test_dsml_double_bar_calls_wrapper_with_intro():
+    text = ("I'll pull the latest changes.\n\n"
+            "<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"bash\">\n"
+            "<｜｜DSML｜｜ parameter name=\"command\" string=\"true\">cd /x && git pull --ff-only && echo '---'"
+            "</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>")
+    calls = parse_tool_calls(text, DSML_TOOLS)
+    assert len(calls) == 1
+    assert json.loads(calls[0]["function"]["arguments"]) == {"command": "cd /x && git pull --ff-only && echo '---'"}
+
+
+def test_dsml_multiple_invokes_and_json_param():
+    text = ('<｜DSML｜tool_calls><｜DSML｜invoke name="bash"><｜DSML｜parameter name="command" string="true">a</｜DSML｜parameter></｜DSML｜invoke>'
+            '<｜DSML｜invoke name="bash"><｜DSML｜parameter name="command" string="true">b</｜DSML｜parameter>'
+            '<｜DSML｜parameter name="limit" string="false">5</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>')
+    calls = parse_tool_calls(text, DSML_TOOLS)
+    assert [json.loads(c["function"]["arguments"]) for c in calls] == [{"command": "a"}, {"command": "b", "limit": 5}]

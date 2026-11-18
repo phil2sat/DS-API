@@ -145,42 +145,58 @@ def _candidate_from_json(obj: Any, allowed: set[str]) -> list[dict] | None:
 
 
 def _parse_dsml(text: str, allowed: set[str]) -> list[dict] | None:
-    # DeepSeek emits both <｜DSML｜...> and ordinary XML-like variants.
+    # DeepSeek emits <｜DSML｜...>, <｜｜DSML｜｜ ...> (note the space) and plain
+    # XML-like variants; normalise them all to ordinary tags first.
     text = text.translate(str.maketrans({"＜": "<", "＞": ">", "｜": "|"}))
     text = re.sub(r"<\|+\s*DSML\s*\|+\s*", "<", text, flags=re.I)
     text = re.sub(r"</\|+\s*DSML\s*\|+\s*", "</", text, flags=re.I)
-    text = re.sub(r"<\|+\|+\s*DSML\s*\|+\|+\s*", "<", text, flags=re.I)
-    wrapper = re.search(r"<tool_calls\b[^>]*>(.*?)</tool_calls\s*>", text, flags=re.I | re.S)
+    wrapper = re.search(
+        r"<(?:tool_|function_)?calls\b[^>]*>(.*?)</(?:tool_|function_)?calls\s*>",
+        text, flags=re.I | re.S)
     scope = wrapper.group(1) if wrapper else text
     invokes = list(re.finditer(r"<invoke\b([^>]*)>(.*?)</invoke\s*>", scope, flags=re.I | re.S))
-    if len(invokes) != 1 or scope[:invokes[0].start()].strip() or scope[invokes[0].end():].strip():
+    if not invokes:
         return None
-    attrs, body = invokes[0].groups()
-    name_match = re.search(r"\bname\s*=\s*([\"'])(.*?)\1", attrs, flags=re.I | re.S)
-    if not name_match:
+    # Intro prose before the call block is fine; only calls may sit between and
+    # after the invokes.
+    if wrapper and text[wrapper.end():].strip():
         return None
-    args = {}
-    params = list(re.finditer(r"<parameter\b([^>]*)>(.*?)</parameter\s*>", body, flags=re.I | re.S))
-    cursor = 0
-    for match in params:
-        if body[cursor:match.start()].strip():
+    cursor = invokes[0].end()
+    for inv in invokes[1:]:
+        if scope[cursor:inv.start()].strip():
             return None
-        p_name = re.search(r"\bname\s*=\s*([\"'])(.*?)\1", match.group(1), flags=re.I | re.S)
-        if not p_name or p_name.group(2) in args:
+        cursor = inv.end()
+    if scope[cursor:].strip():
+        return None
+
+    calls = []
+    for inv in invokes:
+        attrs, body = inv.groups()
+        name_match = re.search(r"\bname\s*=\s*([\"'])(.*?)\1", attrs, flags=re.I | re.S)
+        if not name_match:
             return None
-        value = html.unescape(match.group(2).strip())
-        is_string = re.search(r"\bstring\s*=\s*([\"'])false\1", match.group(1), flags=re.I)
-        if is_string:
-            try:
-                value = json.loads(value)
-            except json.JSONDecodeError:
+        args, pos = {}, 0
+        for match in re.finditer(r"<parameter\b([^>]*)>(.*?)</parameter\s*>", body, flags=re.I | re.S):
+            if body[pos:match.start()].strip():
                 return None
-        args[p_name.group(2)] = value
-        cursor = match.end()
-    if body[cursor:].strip():
-        return None
-    call = _to_call({"name": name_match.group(2), "arguments": args}, allowed)
-    return [call] if call else None
+            p_name = re.search(r"\bname\s*=\s*([\"'])(.*?)\1", match.group(1), flags=re.I | re.S)
+            if not p_name or p_name.group(2) in args:
+                return None
+            value = html.unescape(match.group(2).strip())
+            if re.search(r"\bstring\s*=\s*([\"'])false\1", match.group(1), flags=re.I):
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError:
+                    return None
+            args[p_name.group(2)] = value
+            pos = match.end()
+        if body[pos:].strip():
+            return None
+        call = _to_call({"name": name_match.group(2), "arguments": args}, allowed)
+        if not call:
+            return None
+        calls.append(call)
+    return calls
 
 
 def _schema_props(tools: list[dict] | None) -> dict[str, dict]:
